@@ -1,4 +1,5 @@
 import logging
+import os
 
 import requests
 
@@ -9,6 +10,15 @@ logger = logging.getLogger(__name__)
 
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 SEARCH_RADII = [5000, 10000, 20000]
+# overpass-api.de exige un User-Agent identifiant l’appli (sinon HTTP 406).
+_OVERPASS_UA = os.environ.get(
+    "OVERPASS_USER_AGENT",
+    "BoviTech-Chatbot-VetAgent/1.0 (Django; OSM amenity=veterinary lookup)",
+)
+OVERPASS_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": _OVERPASS_UA,
+}
 
 
 class VetAgent(BaseAgent):
@@ -41,7 +51,7 @@ class VetAgent(BaseAgent):
                     OVERPASS_URL,
                     data={"data": query},
                     timeout=30,
-                    headers={"Accept": "application/json"},
+                    headers=OVERPASS_HEADERS,
                 )
                 res.raise_for_status()
 
