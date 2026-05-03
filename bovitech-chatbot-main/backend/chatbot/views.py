@@ -61,6 +61,21 @@ NO_LOCATION_MSG = {
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
 
+def _bytes_look_like_image(header: bytes) -> bool:
+    """Si le client envoie application/octet-stream (souvent RN/Expo), accepter si les octets ressemblent à une image."""
+    if len(header) < 12:
+        return False
+    if header.startswith(b"\xff\xd8\xff"):
+        return True
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return True
+    if header.startswith((b"GIF87a", b"GIF89a")):
+        return True
+    if header.startswith(b"RIFF") and header[8:12] == b"WEBP":
+        return True
+    return False
+
+
 def frontend(request):
     return render(request, "index.html")
 
@@ -164,12 +179,15 @@ def skin(request):
     if image_file.size > MAX_IMAGE_BYTES:
         return make_error("IMAGE_TOO_LARGE", "Image must be under 10 MB.")
 
-    # Validate content type quickly
+    image_bytes = b"".join(image_file.chunks())
+
     content_type = image_file.content_type or ""
     if not content_type.startswith("image/"):
-        return make_error("INVALID_IMAGE_TYPE", "File must be an image (jpeg, png, webp...).")
-
-    image_bytes = b"".join(image_file.chunks())
+        if not _bytes_look_like_image(image_bytes[:16]):
+            return make_error(
+                "INVALID_IMAGE_TYPE",
+                "File must be an image (jpeg, png, webp...).",
+            )
 
     data = _skin_agent.run(image_bytes, lang)
 

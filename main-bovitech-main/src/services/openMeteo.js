@@ -3,7 +3,7 @@
  * @see https://open-meteo.com/en/docs
  */
 
-/** Centre Tunisie — si géolocalisation refusée ou indisponible */
+/** Centre Tunis — secours si géolocalisation refusée ou indisponible */
 export const DEFAULT_FARM_COORDS = { latitude: 36.8065, longitude: 10.1815 };
 
 const OPEN_METEO_BASE = 'https://api.open-meteo.com/v1/forecast';
@@ -70,6 +70,22 @@ function pastureHintFromConditions(code, tempC, lang) {
   return isAr
     ? 'راقب الطقس والمراعي قبل تحريك القطيع.'
     : 'Surveillez l’évolution du temps et l’état des parcelles avant la sortie.';
+}
+
+/** Icône Ionicons pour la carte météo (approximation selon code WMO). */
+export function weatherCodeToIonName(code) {
+  const c = code ?? 0;
+  if (c === 0) return 'sunny-outline';
+  if (c === 1) return 'partly-sunny-outline';
+  if (c === 2) return 'cloud-outline';
+  if (c === 3) return 'cloud';
+  if (c >= 45 && c <= 48) return 'water-outline';
+  if (c >= 51 && c <= 57) return 'rainy-outline';
+  if (c >= 61 && c <= 67) return 'rainy-outline';
+  if (c >= 71 && c <= 77) return 'snow-outline';
+  if (c >= 80 && c <= 82) return 'rainy-outline';
+  if (c >= 95) return 'thunderstorm-outline';
+  return 'partly-cloudy-outline';
 }
 
 function formatLocalTime(isoTime) {

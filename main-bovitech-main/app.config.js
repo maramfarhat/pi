@@ -20,6 +20,12 @@ module.exports = {
           NSAllowsLocalNetworking: true,
           NSAllowsArbitraryLoads: true,
         },
+        // Pour ouvrir Google Maps / Plans depuis Linking.canOpenURL
+        LSApplicationQueriesSchemes: [
+          ...(appJson.expo.ios?.infoPlist?.LSApplicationQueriesSchemes || []),
+          'comgooglemaps',
+          'maps',
+        ],
       },
     },
     extra: {
