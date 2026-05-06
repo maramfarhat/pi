@@ -1,6 +1,7 @@
 import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Animated,
+  ActivityIndicator,
   Dimensions,
   FlatList,
   Image,
@@ -16,9 +17,12 @@ import {
   View,
 } from 'react-native';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
+import { Audio } from 'expo-av';
 
 import { cows as initialCows } from '../theme/mockData';
-import { fetchRosetteLiveBundle } from '../services/liveFarmModels';
+import { fetchRosetteLiveBundle, illnessSanteStatColor, illnessSanteValueFr, stressRiskLabelFr } from '../services/liveFarmModels';
+import { predictVocal } from '../services/predictionApi';
+import { recordingUriToBase64 } from '../services/vocalRecordBase64';
 import { useFarmLocation } from '../hooks/useFarmLocation';
 
 import cowV1 from '../../assets/v1.png';
@@ -407,7 +411,11 @@ const CowCard = memo(function CowCard({ cow, index, onPress }) {
           </View>
 
           <View style={card.metaRow}>
-            <Ionicons name="location" size={13} color={COLORS.primary} />
+            <Ionicons
+              name={cow.id === '12' ? 'pulse-outline' : 'location'}
+              size={13}
+              color={COLORS.primary}
+            />
             <Text style={card.meta} numberOfLines={1}>
               {cow.activity}
             </Text>
@@ -994,9 +1002,29 @@ const AddCowSheetContent = memo(function AddCowSheetContent({
   );
 });
 
+function vocalEtatLabelFr(name) {
+  if (!name) return '—';
+  if (name === 'besoin_nourriture') return 'Besoin de nourriture';
+  if (name === 'toux') return 'Toux';
+  if (name === 'normal') return 'Normal';
+  if (name === 'ovulation') return 'Ovulation';
+  return name;
+}
+
+function formatVocalProbabilities(probabilities) {
+  if (!probabilities || typeof probabilities !== 'object') return '';
+  return Object.entries(probabilities)
+    .map(([k, v]) => `${vocalEtatLabelFr(k)}: ${(Number(v) * 100).toFixed(0)} %`)
+    .join(' · ');
+}
+
 const VoiceSheetContent = memo(function VoiceSheetContent({ cow }) {
   const pulse = useRef(new Animated.Value(1)).current;
   const [answer, setAnswer] = useState('');
+  const [err, setErr] = useState('');
+  const [vocalIsRecording, setVocalIsRecording] = useState(false);
+  const [vocalBusy, setVocalBusy] = useState(false);
+  const vocalRecordingRef = useRef(null);
 
   useEffect(() => {
     const loop = Animated.loop(
@@ -1019,33 +1047,148 @@ const VoiceSheetContent = memo(function VoiceSheetContent({ cow }) {
     return () => loop.stop();
   }, [pulse]);
 
-  const handleFakeVoice = () => {
-    setAnswer(
-      `${cow.name} semble avoir faim. Son activité tête baissée et rumination indique qu’elle cherche probablement à manger.`
+  useEffect(() => {
+    return () => {
+      const r = vocalRecordingRef.current;
+      if (!r) return;
+      vocalRecordingRef.current = null;
+      r.stopAndUnloadAsync().catch(() => {});
+    };
+  }, []);
+
+  const ensureMicPermission = async () => {
+    const perm = await Audio.requestPermissionsAsync();
+    if (perm.granted) return true;
+    setErr(
+      perm.status === 'denied'
+        ? 'Permission micro refusée.'
+        : 'Permission micro nécessaire pour enregistrer.'
     );
+    return false;
   };
+
+  const toggleMicAnalyze = async () => {
+    if (vocalBusy) return;
+
+    if (!vocalIsRecording) {
+      setErr('');
+      setAnswer('');
+      const ok = await ensureMicPermission();
+      if (!ok) return;
+      try {
+        await Audio.setAudioModeAsync({
+          allowsRecordingIOS: true,
+          playsInSilentModeIOS: true,
+        });
+        const { recording } = await Audio.Recording.createAsync(
+          Audio.RecordingOptionsPresets.HIGH_QUALITY
+        );
+        vocalRecordingRef.current = recording;
+        setVocalIsRecording(true);
+      } catch (e) {
+        setErr(e?.message || 'Impossible de démarrer l’enregistrement');
+        setVocalIsRecording(false);
+        vocalRecordingRef.current = null;
+      }
+      return;
+    }
+
+    const rec = vocalRecordingRef.current;
+    if (!rec) return;
+
+    setVocalBusy(true);
+    setErr('');
+    try {
+      await rec.stopAndUnloadAsync();
+      const uri = rec.getURI();
+      vocalRecordingRef.current = null;
+      setVocalIsRecording(false);
+
+      if (!uri) throw new Error('Fichier audio introuvable');
+
+      const b64 = await recordingUriToBase64(uri);
+      const out = await predictVocal(b64);
+
+      if (out?.ok) {
+        const etat = vocalEtatLabelFr(out.pred_vocal_name);
+        const probs = formatVocalProbabilities(out.probabilities);
+        setAnswer(
+          `${cow.name} — état vocal (IA) : ${etat}.${probs ? `\n\n${probs}` : ''}`
+        );
+      } else {
+        const msg =
+          typeof out?.error === 'string' ? out.error : 'Prédiction vocale impossible (API).';
+        setErr(msg);
+        setAnswer('');
+      }
+    } catch (e) {
+      setAnswer('');
+      setErr(e?.response?.data?.error || e.message || 'Erreur réseau / audio');
+    } finally {
+      setVocalBusy(false);
+      try {
+        await Audio.setAudioModeAsync({ allowsRecordingIOS: false });
+      } catch {
+        /* ignore */
+      }
+    }
+  };
+
+  const recordingHint =
+    vocalIsRecording && !vocalBusy ? 'Réappuyez sur le micro pour envoyer au modèle' : '';
 
   return (
     <View style={voice.content}>
       <Text style={voice.desc}>
-        Appuie sur le micro pour simuler un vocal. Pour le front-only, la réponse est mockée.
+        Enregistrez le vocal de cette vache. Modèle vocal (mel Keras): toux, normal, ovulation,
+        besoin de nourriture — même flux que Prédictions (API port 8008).
       </Text>
 
       <Animated.View style={[voice.micOuter, { transform: [{ scale: pulse }] }]}>
-        <TouchableOpacity activeOpacity={0.86} style={voice.micBtn} onPress={handleFakeVoice}>
-          <Ionicons name="mic" size={34} color={COLORS.white} />
+        <TouchableOpacity
+          activeOpacity={0.86}
+          style={[
+            voice.micBtn,
+            vocalIsRecording && voice.micBtnRecording,
+            vocalBusy && { opacity: 0.82 },
+          ]}
+          onPress={toggleMicAnalyze}
+          disabled={vocalBusy}
+        >
+          {vocalBusy ? (
+            <ActivityIndicator color={COLORS.white} size="large" />
+          ) : (
+            <Ionicons name="mic" size={34} color={COLORS.white} />
+          )}
         </TouchableOpacity>
       </Animated.View>
 
-      <Text style={voice.hint}>Exemple vocal : “Comment va cette vache ?”</Text>
+      <Text style={voice.hint}>
+        {recordingHint || 'Premier tap = enregistrer · second tap = analyse IA'}
+      </Text>
+      {recordingHint ? (
+        <Text style={[voice.subHint, { marginBottom: 10 }]}>
+          Visez 1–3 s de vocal net pour une meilleure détection.
+        </Text>
+      ) : (
+        <View style={{ height: 8 }} />
+      )}
+
+      {!!err && (
+        <Text style={voice.errMsg} selectable>
+          {err}
+        </Text>
+      )}
 
       {!!answer && (
         <View style={voice.answerBox}>
           <View style={voice.answerIcon}>
-            <MaterialCommunityIcons name="cow" size={20} color={COLORS.primary} />
+            <MaterialCommunityIcons name="pulse" size={20} color={COLORS.primary} />
           </View>
 
-          <Text style={voice.answerText}>{answer}</Text>
+          <Text style={voice.answerText} selectable>
+            {answer}
+          </Text>
         </View>
       )}
     </View>
@@ -1076,7 +1219,7 @@ const CowDetailModal = memo(function CowDetailModal({
       ...cow,
       milkToday: liveRosette.milkKg,
       temp: liveRosette.tempC,
-      activity: liveRosette.behaviorLabelFr,
+      activity: liveRosette.stressLabelFr,
     };
   }, [cow, liveRosette]);
 
@@ -1169,6 +1312,41 @@ const CowDetailModal = memo(function CowDetailModal({
 
     const { color } = getStatusStyle(displayCow.status);
 
+    const rosetteStressLive = cow?.id === '12' && liveRosette?.apiReachable;
+    let stressStatCol = COLORS.sage;
+    if (rosetteStressLive && liveRosette?.stress && liveRosette.stress.ok !== false) {
+      const k = Number(liveRosette.stress.pred_stress);
+      if (k === 2) stressStatCol = '#C84C4C';
+      else if (k === 1) stressStatCol = COLORS.warning;
+      else if (k === 0) stressStatCol = COLORS.success;
+    }
+
+    const rosetteIllnessOk = cow?.id === '12' && liveRosette?.illness?.ok === true;
+    let santeValue = displayCow.status === 'ok' ? 'Stable' : 'À suivre';
+    let santeCol = color;
+    if (rosetteIllnessOk && liveRosette.illness) {
+      const v = illnessSanteValueFr(liveRosette.illness);
+      if (v) santeValue = v;
+      const hc = illnessSanteStatColor(liveRosette.illness.health_score);
+      if (hc) santeCol = hc;
+    }
+
+    const stressOrActivityStat = rosetteStressLive
+      ? {
+          icon: 'pulse-outline',
+          value: stressRiskLabelFr(liveRosette.stress),
+          label: 'Niveau de stress',
+          col: stressStatCol,
+          lib: 'io',
+        }
+      : {
+          icon: 'pulse-outline',
+          value: displayCow.status === 'ok' ? 'Normale' : 'Faible',
+          label: 'Activité',
+          col: COLORS.warning,
+          lib: 'io',
+        };
+
     return [
       {
         icon: 'thermometer',
@@ -1184,23 +1362,12 @@ const CowDetailModal = memo(function CowDetailModal({
         col: COLORS.primary,
         lib: 'mc',
       },
-      {
-        icon: 'pulse-outline',
-        value:
-          cow?.id === '12' && liveRosette?.apiReachable
-            ? liveRosette.behaviorLabelFr
-            : displayCow.status === 'ok'
-              ? 'Normale'
-              : 'Faible',
-        label: 'Activité',
-        col: COLORS.warning,
-        lib: 'io',
-      },
+      stressOrActivityStat,
       {
         icon: 'shield-checkmark-outline',
-        value: displayCow.status === 'ok' ? 'Stable' : 'À suivre',
+        value: santeValue,
         label: 'Santé',
-        col: color,
+        col: santeCol,
         lib: 'io',
       },
     ];
@@ -1378,7 +1545,9 @@ const CowDetailModal = memo(function CowDetailModal({
 
                 <View style={{ flex: 1 }}>
                   <Text style={detail.talkTitle}>Parle-moi</Text>
-                  <Text style={detail.talkText}>Pose une question vocale sur cette vache</Text>
+                  <Text style={detail.talkText}>
+                    Vocal + classification IA du son (toux, normal, ovulation, nourriture)
+                  </Text>
                 </View>
 
                 <Ionicons name="chevron-forward" size={18} color={COLORS.primary} />
@@ -1477,7 +1646,7 @@ const CowDetailModal = memo(function CowDetailModal({
           visible={voiceOpen}
           title="Parle-moi"
           onClose={() => setVoiceOpen(false)}
-          height={420}
+          height={540}
         >
           <VoiceSheetContent cow={cow} />
         </BottomSheet>
@@ -1533,7 +1702,7 @@ export default function HerdScreen() {
       setCows((prev) =>
         prev.map((c) =>
           c.id === '12'
-            ? { ...c, milkToday: b.milkKg, temp: b.tempC, activity: b.behaviorLabelFr }
+            ? { ...c, milkToday: b.milkKg, temp: b.tempC, activity: b.stressLabelFr }
             : c
         )
       );
@@ -2764,12 +2933,38 @@ const voice = StyleSheet.create({
     shadowRadius: 16,
     elevation: 8,
   },
+  micBtnRecording: {
+    backgroundColor: COLORS.warning,
+    shadowColor: COLORS.warning,
+  },
   hint: {
     fontFamily: 'Inter_600SemiBold',
     fontSize: 12,
     color: COLORS.sage,
     marginTop: 24,
     marginBottom: 18,
+    textAlign: 'center',
+  },
+  subHint: {
+    fontFamily: 'Inter_500Medium',
+    fontSize: 11,
+    color: COLORS.sage,
+    opacity: 0.9,
+    textAlign: 'center',
+    alignSelf: 'stretch',
+    paddingHorizontal: 8,
+    lineHeight: 16,
+    marginBottom: 6,
+  },
+  errMsg: {
+    width: '100%',
+    marginTop: 8,
+    marginBottom: 4,
+    fontFamily: 'Inter_600SemiBold',
+    fontSize: 11,
+    color: COLORS.danger,
+    textAlign: 'center',
+    lineHeight: 16,
   },
   answerBox: {
     width: '100%',

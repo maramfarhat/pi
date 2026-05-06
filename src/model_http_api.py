@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import sys
@@ -23,6 +24,10 @@ SRC_DIR = Path(__file__).resolve().parent
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from vocal_preprocess import audio_bytes_to_model_input, parse_class_labels_env
+from build_rl_state import build_state_vector
+from illness.health_score import build_temporal_health_score
+
 MODEL_DIR = ROOT_DIR / "finale_model"
 DEFAULT_BEHAVIOR_MODEL = MODEL_DIR / "behavior_rf_multimodal.joblib"
 DEFAULT_MILK_MODEL = MODEL_DIR / "milk_xgb_pred_behavior_daily_milkhist_pipeline.joblib"
@@ -33,6 +38,12 @@ DEFAULT_FAKE_IMU_CSV = ROOT_DIR / "T10_0725.csv"
 DEFAULT_STRESS_V3 = MODEL_DIR / "StressDetectionV3_trained.pt"
 STRESS_V3_WINDOW = 60
 STRESS_CLASS_NAMES: tuple[str, str, str] = ("Normal", "At risk", "Stressed")
+ILLNESS_ACTION_NAMES: tuple[str, str, str] = ("Healthy", "At-risk", "Ill")
+ILLNESS_ACTION_NAMES_FR: dict[str, str] = {
+    "Healthy": "Bon état",
+    "At-risk": "À risque",
+    "Ill": "Alerte santé",
+}
 EIGHT_H_SECONDS = 8 * 60 * 60
 
 BEHAVIOR_LABELS: dict[int, str] = {
@@ -260,6 +271,202 @@ class StressV3Runtime:
                 "lying_minutes_8h": float(lying_minutes_8h),
                 "cow_id": cow_id,
             },
+        }
+
+
+def _sb3_zip_from_unpacked_dir(unzipped: Path) -> Optional[Path]:
+    """Stable-Baselines3 loads a .zip; materialize `{dir}.zip` from an extracted save once."""
+    if not unzipped.is_dir():
+        return None
+    zip_path = unzipped.parent / f"{unzipped.name}.zip"
+    if zip_path.is_file():
+        return zip_path
+    if not (unzipped / "policy.pth").is_file():
+        return None
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in unzipped.iterdir():
+                if f.is_file():
+                    zf.write(f, arcname=f.name)
+    except OSError:
+        return None
+    return zip_path if zip_path.is_file() else None
+
+
+def _resolve_illness_ppo_zip() -> Optional[Path]:
+    raw = os.environ.get("ILLNESS_PPO_PATH", "").strip()
+    if raw:
+        p = Path(raw).expanduser().resolve()
+        if p.is_file() and p.suffix.lower() == ".zip":
+            return p
+        z = _sb3_zip_from_unpacked_dir(p)
+        if z is not None:
+            return z
+    base = MODEL_DIR / "artifacts" / "illness_model" / "illness_ppo"
+    return _sb3_zip_from_unpacked_dir(base)
+
+
+class IllnessPpoRuntime:
+    """PPO policy for illness classes Healthy / At-risk / Ill (34-d Box state)."""
+
+    def __init__(self) -> None:
+        self._ok = False
+        self._err = ""
+        self._model: Any = None
+        self._path: Optional[Path] = None
+        self._load()
+
+    def _load(self) -> None:
+        zp = _resolve_illness_ppo_zip()
+        self._path = zp
+        if zp is None or not zp.is_file():
+            self._ok = False
+            self._err = (
+                "Illness PPO not found: place illness_ppo.zip or unpack SB3 save under "
+                f"{MODEL_DIR / 'artifacts' / 'illness_model' / 'illness_ppo'} "
+                "(or set ILLNESS_PPO_PATH)."
+            )
+            return
+        try:
+            from stable_baselines3 import PPO  # noqa: PLC0415
+        except Exception as exc:  # noqa: BLE001
+            self._ok = False
+            self._err = f"stable_baselines3 import failed: {exc}"
+            return
+        try:
+            self._model = PPO.load(str(zp), device="cpu")
+            self._model.policy.set_training_mode(False)
+            self._ok = True
+            self._err = ""
+        except Exception as exc:  # noqa: BLE001
+            self._ok = False
+            self._err = f"Failed to load illness PPO from {zp}: {exc}"
+
+    @property
+    def ok(self) -> bool:
+        return self._ok
+
+    @property
+    def error(self) -> str:
+        return self._err
+
+    @property
+    def model_path(self) -> Optional[Path]:
+        return self._path
+
+    def policy_probs(self, obs: np.ndarray) -> np.ndarray:
+        if not self._ok or self._model is None:
+            raise RuntimeError(self._err or "Illness model not loaded.")
+        import torch  # noqa: PLC0415
+
+        obs_vec = np.asarray(obs, dtype=np.float32).reshape(1, -1)
+        obs_tensor = torch.tensor(obs_vec, dtype=torch.float32)
+        with torch.no_grad():
+            features = self._model.policy.extract_features(obs_tensor)
+            latent_pi, _ = self._model.policy.mlp_extractor(features)
+            dist = self._model.policy._get_action_dist_from_latent(latent_pi)
+            probs = dist.distribution.probs
+            if hasattr(probs, "detach"):
+                probs = probs.detach()
+            return probs.cpu().numpy().astype(np.float32).ravel()
+
+
+def _resolve_vocal_model_path() -> Path:
+    raw = os.environ.get("VOCAL_MODEL_PATH", "").strip()
+    if raw:
+        p = Path(raw).expanduser().resolve()
+        if p.is_file():
+            return p
+    cand = MODEL_DIR / "model_audio_classification.h5"
+    if cand.is_file():
+        return cand.resolve()
+    matches = sorted(MODEL_DIR.glob("model_audio_classification*.h5"))
+    if matches:
+        return matches[0].resolve()
+    return cand
+
+
+class VocalClassificationRuntime:
+    """
+    Keras CNN on 128×128×1 mel-spectrogram (see vocal_preprocess).
+    Class names default to toux, normal, ovulation, besoin_nourriture — override with VOCAL_CLASS_ORDER.
+    """
+
+    def __init__(self) -> None:
+        self._model: Any = None
+        self._path_checked: Optional[Path] = None
+        self._ok = False
+        self._err = ""
+        self._labels = parse_class_labels_env()
+
+    def refresh_labels(self) -> None:
+        self._labels = parse_class_labels_env()
+
+    def probe_path(self) -> tuple[Optional[Path], bool]:
+        self._path_checked = _resolve_vocal_model_path()
+        return self._path_checked, self._path_checked.is_file()
+
+    def _load(self) -> None:
+        if self._model is not None:
+            return
+        path = _resolve_vocal_model_path()
+        self._path_checked = path
+        if not path.is_file():
+            self._ok = False
+            self._err = f"Vocal model not found: {path} (copy .h5 to finale_model/ or set VOCAL_MODEL_PATH)"
+            return
+        try:
+            import tensorflow as tf  # noqa: PLC0415
+        except ImportError as exc:
+            self._ok = False
+            self._err = f"tensorflow not installed: {exc}"
+            return
+        try:
+            self._model = tf.keras.models.load_model(path)
+            self._ok = True
+            self._err = ""
+        except Exception as exc:  # noqa: BLE001
+            self._model = None
+            self._ok = False
+            self._err = f"Failed to load vocal model: {exc}"
+
+    @property
+    def ok(self) -> bool:
+        return self._ok
+
+    @property
+    def error(self) -> str:
+        return self._err
+
+    def predict_from_audio_bytes(self, raw: bytes) -> dict[str, Any]:
+        if len(raw) < 200:
+            return {"ok": False, "error": "Audio trop court ou fichier invalide."}
+        self._load()
+        if not self._ok or self._model is None:
+            return {"ok": False, "error": self._err or "Vocal model unavailable."}
+        if len(self._labels) != 4:
+            return {"ok": False, "error": "VOCAL_CLASS_ORDER must list exactly 4 comma-separated labels."}
+        try:
+            x = audio_bytes_to_model_input(raw)
+            batch = np.expand_dims(x, 0).astype(np.float32)
+            probs_arr = np.asarray(self._model.predict(batch, verbose=0), dtype=np.float32).ravel()
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+        if probs_arr.size != 4:
+            return {"ok": False, "error": f"Unexpected model output size {probs_arr.size} (need 4)."}
+        probs_arr = probs_arr.astype(np.float64)
+        s = float(np.sum(probs_arr))
+        if s > 1e-12:
+            probs_arr = probs_arr / s
+        probs_arr = probs_arr.astype(np.float32)
+        k = int(np.argmax(probs_arr))
+        return {
+            "ok": True,
+            "pred_vocal_class": k,
+            "pred_vocal_name": self._labels[k] if 0 <= k < len(self._labels) else str(k),
+            "probabilities": {self._labels[i]: float(probs_arr[i]) for i in range(4)},
         }
 
 
@@ -587,6 +794,8 @@ class FakeSensorSimulator:
 RUNTIME = ModelRuntime()
 SIMULATOR = FakeSensorSimulator(DEFAULT_FAKE_IMU_CSV)
 STRESS_V3 = StressV3Runtime()
+ILLNESS_PPO = IllnessPpoRuntime()
+VOCAL_CLF = VocalClassificationRuntime()
 LYING8H = Lying8hBuffer()
 
 # Dernière mesure DHT/THI (ferme) — alimentée par POST /barn_sensor (ex. ESP8266) ou relais USB.
@@ -598,6 +807,85 @@ BARN_LATEST: dict[str, Any] = {
     "thi": None,
     "updated_iso": None,
 }
+
+
+def _resolve_stress_for_illness(payload: dict[str, Any], barn: dict[str, Any]) -> dict[str, Any]:
+    st = payload.get("stress")
+    if isinstance(st, dict) and st.get("ok") is not False and "pred_stress" in st:
+        return st
+    thi = _resolve_thi_for_stress(payload, barn)
+    cbt = _safe_float(payload.get("cbt_temp_c"), _safe_float(payload.get("cbt"), 38.4))
+    ly8 = _safe_float(payload.get("lying_minutes_8h"), float("nan"))
+    if ly8 != ly8 and payload.get("use_server_lying_buffer"):
+        ly8 = LYING8H.lying_minutes_8h()
+    if ly8 != ly8:
+        b = payload.get("pred_behavior")
+        if b is not None and int(b) == 7:
+            ly8 = 0.45 * 480.0
+        elif b is not None:
+            ly8 = 0.25 * 480.0
+        else:
+            ly8 = 4.0 * 60.0
+    cow = str(payload.get("cow_id", "C01"))
+    if not STRESS_V3.ok:
+        return {"ok": False, "error": STRESS_V3.error or "Stress model not loaded."}
+    return STRESS_V3.predict(thi, cbt, float(ly8), cow)
+
+
+def _predict_illness_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if not ILLNESS_PPO.ok:
+        return {"ok": False, "error": ILLNESS_PPO.error or "Illness model not loaded."}
+    with BARN_LOCK:
+        barn = dict(BARN_LATEST)
+    stress = _resolve_stress_for_illness(payload, barn)
+    milk_out = RUNTIME.predict_milk(payload if isinstance(payload, dict) else {})
+    milk_kg = float(milk_out.get("prediction_milk_kg_day", 18.0))
+
+    merged = dict(payload) if isinstance(payload, dict) else {}
+    merged.setdefault("prediction_milk_kg_day", milk_kg)
+
+    obs, meta = build_state_vector(merged, barn=barn, stress=stress)
+    probs_vec = ILLNESS_PPO.policy_probs(obs)
+    k = int(np.argmax(probs_vec))
+    names = ILLNESS_ACTION_NAMES
+    class_name = names[k] if 0 <= k < len(names) else str(k)
+    illness_probs = {names[i]: float(probs_vec[i]) for i in range(min(len(names), len(probs_vec)))}
+
+    s_probs = stress.get("probabilities") if isinstance(stress.get("probabilities"), dict) else {}
+    stress_p2 = float(s_probs.get("Stressed", 0.0)) if stress.get("ok") is not False else 0.0
+
+    model_predictions = {
+        "pred_behavior": float(_safe_float(merged.get("pred_behavior"), 0.0)),
+        "prediction_milk_kg_day": milk_kg,
+        "pred_stress": float(
+            _safe_float(stress.get("pred_stress"), 0.0) if stress.get("ok") is not False else 0.0
+        ),
+        "stress_prob_2": stress_p2,
+        "cbt_temp_c": float(_safe_float(merged.get("cbt_temp_c"), _safe_float(merged.get("cbt"), 38.5))),
+    }
+
+    temporal = build_temporal_health_score(
+        cow_id=merged.get("cow_id", "C01"),
+        timestamp=merged.get("timestamp"),
+        predicted_action=k,
+        confidence=float(probs_vec[k]),
+        illness_probs=illness_probs,
+        model_predictions=model_predictions,
+        top_features=None,
+        inrae_row=None,
+    )
+    return {
+        "ok": True,
+        "predicted_action": k,
+        "class_name": class_name,
+        "class_name_fr": ILLNESS_ACTION_NAMES_FR.get(class_name, class_name),
+        "probabilities": illness_probs,
+        "confidence": float(probs_vec[k]),
+        "health_score": temporal.get("health_score"),
+        "health_status": temporal.get("health_status"),
+        "health_detail": temporal,
+        "state_meta": meta,
+    }
 
 
 def _resolve_thi_for_stress(payload: dict[str, Any], barn: dict[str, Any]) -> float:
@@ -635,6 +923,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/health":
             with BARN_LOCK:
                 barn = dict(BARN_LATEST)
+            vpath, vfound = VOCAL_CLF.probe_path()
             self._write_json(
                 HTTPStatus.OK,
                 {
@@ -646,6 +935,18 @@ class RequestHandler(BaseHTTPRequestHandler):
                         "ok": bool(STRESS_V3.ok),
                         "path": str(p) if (p := STRESS_V3.checkpoint_path) else None,
                         "error": STRESS_V3.error or None,
+                    },
+                    "vocal_classifier": {
+                        "model_path": str(vpath) if vpath else None,
+                        "model_found": bool(vfound),
+                        "labels": parse_class_labels_env(),
+                        "loaded": bool(VOCAL_CLF.ok),
+                        "error": VOCAL_CLF.error or None,
+                    },
+                    "illness_ppo": {
+                        "ok": bool(ILLNESS_PPO.ok),
+                        "path": str(p) if (p := ILLNESS_PPO.model_path) else None,
+                        "error": ILLNESS_PPO.error or None,
                     },
                 },
             )
@@ -702,6 +1003,30 @@ class RequestHandler(BaseHTTPRequestHandler):
                 out = RUNTIME.predict_milk(payload if isinstance(payload, dict) else {})
                 self._write_json(HTTPStatus.OK, out)
                 return
+            if path == "/predict/vocal":
+                VOCAL_CLF.refresh_labels()
+                p = payload if isinstance(payload, dict) else {}
+                b64 = p.get("audio_wav_base64") or p.get("audio_base64")
+                if not b64 or not isinstance(b64, str):
+                    self._write_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "ok": False,
+                            "error": "Champ audio_wav_base64 requis (WAV ou M4A en base64, mono recommandé).",
+                        },
+                    )
+                    return
+                try:
+                    raw = base64.b64decode(b64, validate=False)
+                except Exception as exc:
+                    self._write_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"ok": False, "error": f"Base64 invalide: {exc}"},
+                    )
+                    return
+                out = VOCAL_CLF.predict_from_audio_bytes(raw)
+                self._write_json(HTTPStatus.OK, out)
+                return
             if path == "/predict/stress":
                 p = payload if isinstance(payload, dict) else {}
                 with BARN_LOCK:
@@ -729,6 +1054,17 @@ class RequestHandler(BaseHTTPRequestHandler):
                     )
                     return
                 out = STRESS_V3.predict(thi, cbt, float(ly8), cow)
+                self._write_json(HTTPStatus.OK, out)
+                return
+            if path == "/predict/illness":
+                p = payload if isinstance(payload, dict) else {}
+                out = _predict_illness_payload(p)
+                if out.get("ok") is False:
+                    self._write_json(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        out,
+                    )
+                    return
                 self._write_json(HTTPStatus.OK, out)
                 return
             if path == "/barn_sensor":

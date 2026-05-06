@@ -1,5 +1,5 @@
 import { fetchBarnSensor } from './barnSensors';
-import { predictBehavior, predictMilk, predictStress, simulateTick } from './predictionApi';
+import { predictBehavior, predictIllness, predictMilk, predictStress, simulateTick } from './predictionApi';
 
 /** Heure locale 24 h pour axe du graphe (ex. 23:53:07). */
 export function formatBehaviorSampleTimeFr(date = new Date()) {
@@ -97,6 +97,39 @@ export function stressSubtitleFr(stress) {
   const name = String(stress.pred_stress_name || '');
   if (/normal/i.test(name)) return 'Confort thermique';
   return name || '—';
+}
+
+export function stressRiskLabelFr(stress) {
+  if (!stress || stress.ok === false) return '—';
+  const k = Number(stress.pred_stress);
+  if (k === 0) return 'Normal';
+  if (k === 1) return 'À risque';
+  if (k === 2) return 'Stressé';
+  const raw = String(stress.pred_stress_name || '').trim();
+  const name = raw.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+  if (name.includes('normal')) return 'Normal';
+  if (name.includes('at risk') || raw.toLowerCase().includes('risque')) return 'À risque';
+  if (name.includes('stressed') || raw.toLowerCase().includes('stress')) return 'Stressé';
+  return raw || '—';
+}
+
+/** Réponse POST /predict/illness : PPO + score 0–100 pour la carte Santé (détail vache). */
+export function illnessSanteValueFr(illness) {
+  if (!illness || illness.ok === false) return null;
+  const score = illness.health_score;
+  const label = illness.class_name_fr || illness.class_name || '—';
+  if (typeof score === 'number' && Number.isFinite(score)) {
+    return `${label} · ${Math.round(score)}/100`;
+  }
+  return label;
+}
+
+export function illnessSanteStatColor(score) {
+  const s = Number(score);
+  if (!Number.isFinite(s)) return null;
+  if (s >= 75) return '#4F8F63';
+  if (s >= 55) return '#D9962F';
+  return '#C84C4C';
 }
 
 export function behaviorLabelFr(predBehavior) {
@@ -348,11 +381,72 @@ export async function fetchRosetteLiveBundle(rosetteId = '12') {
   const tempC = Number(sensor.cbt_temp_c);
   const behaviorLabel = behaviorLabelFr(lastBehaviorPid);
 
+  /** Même flux que fetchHomeDashboardModelPayload / Prédictions : POST /predict/stress. */
+  let stress = lastTick?.stress ?? null;
+  if (lastTick?.sensor) {
+    try {
+      const s = lastTick.sensor;
+      const merged = await predictStress({
+        cow_id: apiCow,
+        cbt_temp_c: Number(s.cbt_temp_c ?? 38.4),
+        temp_c: barn?.ok ? Number(barn.temp_c) : Number(s.temp_c ?? 25),
+        humidity_per: barn?.ok ? Number(barn.humidity) : Number(s.humidity_per ?? 60),
+        thi: barn?.ok && barn.thi != null ? Number(barn.thi) : undefined,
+        pred_behavior: lastBehaviorPid,
+        use_server_lying_buffer: true,
+      });
+      if (merged && merged.ok !== false) {
+        stress = merged;
+      }
+    } catch {
+      /* conserve stress du tick si présent */
+    }
+  }
+
+  const stressLabelFr = stressRiskLabelFr(stress);
+
+  let illness = null;
+  if (lastTick?.sensor) {
+    try {
+      const todayIso = isoDateDaysAgo(0);
+      const s = lastTick.sensor;
+      illness = await predictIllness({
+        cow_id: apiCow,
+        timestamp: new Date().toISOString(),
+        accel_x_mps2: s.accel_x_mps2,
+        accel_y_mps2: s.accel_y_mps2,
+        accel_z_mps2: s.accel_z_mps2,
+        mag_x_uT: s.mag_x_uT,
+        mag_y_uT: s.mag_y_uT,
+        mag_z_uT: s.mag_z_uT,
+        temp_c: barn?.ok ? barn.temp_c : s.temp_c,
+        humidity_per: barn?.ok ? barn.humidity : s.humidity_per,
+        thi: barn?.ok && barn.thi != null ? Number(barn.thi) : undefined,
+        cbt_temp_c: s.cbt_temp_c,
+        DIM: Number(s.DIM) || 220,
+        date: todayIso,
+        milk_lag1: s.milk_lag1,
+        milk_roll3_mean: s.milk_roll3_mean,
+        behavior_mean: s.behavior_mean,
+        behavior_n: s.behavior_n,
+        behavior_std: s.behavior_std,
+        pred_behavior: lastBehaviorPid,
+        stress,
+        use_server_lying_buffer: true,
+      });
+    } catch {
+      illness = null;
+    }
+  }
+
   return {
     milkKg: Math.round(milkKg * 10) / 10,
     tempC: Number.isFinite(tempC) ? Math.round(tempC * 10) / 10 : 38.4,
     behaviorLabelFr: behaviorLabel,
+    stress,
+    stressLabelFr,
     activityRows,
     apiReachable: !!lastTick,
+    illness,
   };
 }

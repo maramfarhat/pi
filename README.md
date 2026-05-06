@@ -1,372 +1,266 @@
-# Cow Behavior Prediction Pipeline (MmCows-style Sensor Data)
+# Bovitech — Multimodal Smart Cattle Monitoring
 
-This project gives you a complete, practical workflow to:
+**Bovitech** is a research-grade, multimodal decision-support stack for intelligent cattle monitoring. It combines **wearable IMU signals**, **barn environment**, **acoustics**, and **herd context** to support behavior understanding, stress awareness, production tracking, and early health signals. The system mixes classical ML, deep learning, and reinforcement learning depending on the modality.
 
-1. Read raw neck IMMU sensor data (`accel_*`, optional `mag_*`)
-2. Aggregate high-frequency readings into per-second features
-3. Align with per-second behavior labels
-4. Train a behavior classifier
-5. Predict behavior from new sensor data when you attach sensors to your cow
-
-It is designed to match your current data layout and your real goal:
-**once you collect sensor data from a cow, run prediction and get behavior over time**.
+This project was developed as part of an academic program at **[ESPRIT School of Engineering](https://esprit.tn/)** (Tunisia).
 
 ---
 
-## 1) What You Already Have
+## Why this repository matters
 
-Your workspace includes MmCows-like files:
-
-- Sensor stream (high frequency):  
-  `sensor_data/sensor_data/main_data/immu/Txx/Txx_MMDD.csv`
-- Behavior labels (1 Hz):  
-  `sensor_data/sensor_data/behavior_labels/individual/Cxx_MMDD.csv`
-
-Example pair:
-
-- IMMU: `.../immu/T01/T01_0725.csv`
-- Label: `.../behavior_labels/individual/C01_0725.csv`
-
-### Why this matters
-
-- IMMU file has many rows per second (e.g. timestamp `1690261200.0`, `1690261200.1`, ...)
-- Label file has exactly one row per second (`1690261200`, `1690261201`, ...)
-
-So we must aggregate IMMU data per second before training.
+- **End-to-end scope**: from tabular sensor pipelines and trained artifacts to a **mobile operator UI** and a **lightweight HTTP inference service** usable on a farm PC or edge device.
+- **Multimodal by design**: behavior, milk, stress, vocalization, and fused “illness / early-warning” states are wired behind a single, documented API surface.
+- **Explainability where it counts**: the illness pathway integrates SHAP-style explanations so predictions are reviewable, not black-box alerts.
 
 ---
 
-## 2) What `behavior` Means
+## Capabilities
 
-`behavior` is a **class ID** (categorical target), not a continuous number.
+| Area | What it does | Typical technique |
+|------|----------------|-------------------|
+| **Behavior** | Second-level activity classes from collar (and fused) sensor features | Random Forest (multimodal-ready pipeline) |
+| **Acoustics** | Bovine vocalization classification from recorded audio | CNN on Mel-spectrogram–like input (Keras `.h5`) |
+| **Stress** | Risk classes from THI, core body temperature, lying/rest proxies | PyTorch sequence model (`StressDetectionV3`) |
+| **Milk** | Daily yield estimate from behavior + history-style features | XGBoost + sklearn preprocessing pipeline |
+| **Health / early warning** | Three-way state: healthy, at-risk, ill — plus temporal health score | PPO (Stable-Baselines3) + SHAP explanations |
+| **Simulation / demo** | Tick-based simulation and barn sensor ingest for demos | Built into the inference server |
 
-- Raw labels may include `0` (Unknown). **Training** (`train_model.py`) drops `behavior==0` by default; use `--keep-unknown` to keep it.
-- Supervised classes used by the model are **`1`–`7`** (see mapping below).
-- Each ID corresponds to a real behavior category (e.g., standing, walking, etc.)
+Behavior classes supported in production mapping include: *Walking, Standing, Feeding (head up / down), Licking, Drinking, Lying* (see `BEHAVIOR_LABELS` in `src/model_http_api.py`).
 
-If you have the official mapping from dataset docs/annotation rules, create:
+---
 
-`artifacts/model/behavior_map.json`
+## High-level architecture
 
-```json
-{
-  "1": "Walking",
-  "2": "Standing",
-  "3": "Feeding head up"
-}
+```mermaid
+flowchart LR
+  subgraph client["Operator devices"]
+    A["Expo / React Native app\n(main-bovitech-main)"]
+  end
+  subgraph inference["ML inference service"]
+    B["Python HTTP API\nsrc/model_http_api.py :8008"]
+  end
+  subgraph models["Trained artifacts"]
+    C["finale_model/\n.joblib / .pt / .h5 / SB3 zip"]
+  end
+  subgraph optional["Optional backends"]
+    D["PI_Backend\nDjango + DRF"]
+    E["bovitech-chatbot-main\nDjango + agents"]
+  end
+  A -->|REST JSON| B
+  B --> models
+  A -.->|optional| D
+  A -.->|optional| E
 ```
 
-If mapping is not available yet, training still works with numeric IDs.
+---
+
+## Repository layout
+
+| Path | Role |
+|------|------|
+| `src/model_http_api.py` | **Main inference server** (stdlib `ThreadingHTTPServer`): `/health`, `/predict/*`, `/simulate/tick`, `/barn_sensor` |
+| `src/train_model.py`, `src/predict_behavior.py`, `src/pipeline_utils.py` | IMMU → per-second features → train / predict behavior |
+| `src/stress_v3_model.py`, `stress_sensor/` | Stress model training / evaluation tooling |
+| `src/vocal_preprocess.py` | Audio decoding (incl. ffmpeg), features for vocal CNN |
+| `src/build_rl_state.py`, `src/illness/` | Fused state vector + PPO policy + SHAP explainer + health score |
+| `src/dashboard_app.py` | Streamlit-style analytics entry point (when used) |
+| `finale_model/` | Checkpoints and pipelines expected at runtime (see below) |
+| `main-bovitech-main/` | **Bovitech mobile app** (Expo SDK ~54, React Native) |
+| `PI_Backend/` | Optional **Django** REST API (accounts, farms, cows) |
+| `bovitech-chatbot-main/` | Optional **Django** chatbot backend (e.g. vet / feed assistants) |
 
 ---
 
-## 3) Pipeline Files
+## Requirements
 
-- `src/pipeline_utils.py`  
-  Core logic: load IMMU, aggregate per second, load labels, align by timestamp.
-- `src/build_dataset.py`  
-  Build merged second-level dataset for a cow/day and save CSV.
-- `src/train_model.py`  
-  Train baseline RandomForest model and save metrics/artifacts.
-- `src/predict_behavior.py`  
-  Predict behavior from a new IMMU file (real deployment usage).
-- `requirements.txt`  
-  Python dependencies.
+### Inference + training (Python)
+
+- **Python** ≥ 3.9 (3.10+ recommended)
+- Core dependencies are listed in **`requirements.txt`**, including: `pandas`, `numpy`, `scikit-learn`, `joblib`, `torch`, `tensorflow>=2.15`, `librosa`, `soundfile`, `streamlit`, `plotly`, `stable-baselines3`, `gymnasium`.
+
+**System packages (recommended):**
+
+- **ffmpeg** — for robust audio decode in vocal classification (Windows: install ffmpeg and/or set `FFMPEG_PATH` to `ffmpeg.exe`).
+- **libsndfile** — usually pulled in via `soundfile` wheels; on minimal Linux images you may need the system library.
+
+**Optional (illness explainability):**
+
+- `shap` — required if you use the illness explainer paths (`src/illness/illness_xai.py`). Install with `pip install shap` if not already present in your environment.
+
+### Mobile app
+
+- **Node.js** 18+
+- **npm** or **yarn**
+- **Expo CLI** (via `npx expo`)
+
+### Optional Django services
+
+- **`PI_Backend/requirements.txt`**: Django LTS 5.2+, Django REST framework, JWT, CORS.
+
+> **Note on naming:** this monorepo uses a **built-in Python HTTP server** for the ML API (not FastAPI). Optional Django apps cover persistence and chat. If you migrate to FastAPI or Supabase, treat that as a deployment choice — the current code paths are as documented above.
 
 ---
 
-## 4) Setup
-
-From project root:
+## Installation
 
 ```bash
+git clone https://github.com/Malek-ami/Bovitech
+cd bovitech
+
 python -m venv .venv
+
+# Windows
 .venv\Scripts\activate
+
+# Linux / macOS
+# source .venv/bin/activate
+
 pip install -r requirements.txt
+# Optional: pip install shap
 ```
+
+### Model artifacts (`finale_model/`)
+
+The server expects trained files under `finale_model/` (and paths can be overridden with environment variables). Examples referenced in code:
+
+- Behavior: `behavior_rf_multimodal.joblib`
+- Milk: `milk_xgb_pred_behavior_daily_milkhist_pipeline.joblib`
+- Stress: `StressDetectionV3_trained.pt` (or set `STRESS_V3_CHECKPOINT`)
+- Vocal: Keras `.h5` (default discovery under `finale_model/` or set `VOCAL_MODEL_PATH`)
+- Illness PPO: SB3-export zip (set `ILLNESS_PPO_PATH` if non-default)
+
+If you clone without large binaries, obtain checkpoints from your team’s artifact store or retrain using the scripts under `src/` and `stress_sensor/`.
 
 ---
 
-## 5) Step-by-Step Usage
+## Running the stack
 
-## A) Build aligned dataset (optional but recommended)
+### 1) ML inference API (required for on-device predictions)
+
+From repository root:
+
+```bash
+python src/model_http_api.py
+```
+
+Default bind: **`http://0.0.0.0:8008`**.
+
+Smoke test:
+
+```bash
+curl http://localhost:8008/health
+```
+
+### 2) Mobile app (`main-bovitech-main/`)
+
+```bash
+cd main-bovitech-main
+npm install
+npx expo start
+```
+
+**Point the app at your API** (see `main-bovitech-main/src/config/api.js`):
+
+| Context | Default `API_BASE_URL` |
+|--------|-------------------------|
+| Android emulator | `http://10.0.2.2:8008` |
+| iOS simulator / web | `http://localhost:8008` |
+| Physical device | Set `EXPO_PUBLIC_API_BASE_URL` to `http://<your-pc-lan-ip>:8008` |
+
+Optional timeouts (ms) for slow CPU inference:
+
+- `EXPO_PUBLIC_API_HTTP_TIMEOUT_MS`
+- `EXPO_PUBLIC_API_VOCAL_TIMEOUT_MS`
+
+Optional chatbot backend URL:
+
+- `EXPO_PUBLIC_CHATBOT_BASE_URL` (defaults to port **8000** for the Django chatbot project)
+
+### 3) Optional: `PI_Backend` (Django)
+
+```bash
+cd PI_Backend
+pip install -r requirements.txt
+python manage.py migrate
+python manage.py runserver
+```
+
+### 4) Optional: `bovitech-chatbot-main`
+
+Follow that project’s `.env` / `SECRET_KEY` / `GROQ_API_KEY` setup in its `backend` app.
+
+---
+
+## HTTP API surface (inference server)
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/health` | Liveness and dependency check |
+| `POST` | `/predict/behavior` | Behavior class from sensor payload |
+| `POST` | `/predict/milk` | Milk yield prediction |
+| `POST` | `/predict/stress` | Stress classes (THI, CBT, lying / behavior context) |
+| `POST` | `/predict/vocal` | Vocal classification (`audio_wav_base64`) |
+| `POST` | `/predict/illness` | PPO + temporal health score + optional SHAP narrative |
+| `GET` | `/simulate/tick` | Demo / simulation tick |
+| `POST` | `/barn_sensor` | Ingest barn environment samples (temperature / humidity → THI) |
+
+Request/response shapes are defined by `RequestHandler` in `src/model_http_api.py` and mirrored in `main-bovitech-main/src/services/predictionApi.js`.
+
+---
+
+## Environment variables (selected)
+
+| Variable | Purpose |
+|----------|---------|
+| `STRESS_V3_CHECKPOINT` | Override path to `StressDetectionV3` `.pt` |
+| `VOCAL_MODEL_PATH` | Override path to vocal `.h5` |
+| `VOCAL_SAMPLE_RATE`, `VOCAL_CLASS_ORDER`, `VOCAL_FFMPEG_TIMEOUT_SEC` | Vocal preprocessing / labeling order / decode timeout |
+| `FFMPEG_PATH` | Explicit path to `ffmpeg` on Windows or constrained PATH |
+| `ILLNESS_PPO_PATH` | Override path to illness PPO export |
+
+---
+
+## Training and batch workflows
+
+Behavior pipeline (IMMU → per-second dataset → RandomForest):
 
 ```bash
 python src/build_dataset.py --sensor-root sensor_data/sensor_data --cow C01 --date 0725 --include-mag --output-csv artifacts/datasets/dataset_C01_0725.csv
+python src/train_model.py --sensor-root sensor_data/sensor_data --cows C01 C02 --dates 0725 --include-mag --out-dir artifacts/model
+python src/predict_behavior.py --immu-file path/to/T01_0725.csv --model-dir artifacts/model --output-csv artifacts/predictions/out.csv
 ```
 
-What this does:
+> Raw datasets are **not** committed by default (see `.gitignore` for `sensor_data/`, `artifacts/`). Place data locally or wire your own storage.
 
-1. Loads `T01_0725.csv` and `C01_0725.csv`
-2. Computes per-second features from raw IMMU
-3. Joins with `behavior` label by second timestamp
-4. Writes a clean training table
-
-Output columns include:
-
-- `ts_sec`
-- aggregated features like `accel_x_mps2_mean`, `accel_mag_std`, `samples_per_sec`, ...
-- `behavior`
+Illness / RL details: `src/illness/README.md`.
 
 ---
 
-## B) Train model
+## Frontend & backend (summary)
 
-Single cow/day:
-
-```bash
-python src/train_model.py --sensor-root sensor_data/sensor_data --cows C01 --dates 0725 --include-mag --out-dir artifacts/model
-```
-
-Multi-cow (recommended):
-
-```bash
-python src/train_model.py --sensor-root sensor_data/sensor_data --cows C01 C02 C03 C04 C05 --dates 0725 --include-mag --out-dir artifacts/model
-```
-
-Training outputs:
-
-- `artifacts/model/behavior_rf.joblib` (trained model)
-- `artifacts/model/metadata.json` (feature list + settings + summary metrics)
-- `artifacts/model/confusion_matrix.csv`
-- `artifacts/model/feature_importance.csv`
-
-Metrics printed:
-
-- Accuracy
-- Macro F1
-- Precision/Recall/F1 per class
-
-### Multimodal (IMMU + head) — alignement entraînement / production
-
-Pour que le modèle voie **les mêmes features** à l’entraînement et sur le collier (sans fichier `head_direction` séparé), les colonnes tête sont **synthétisées** depuis l’IMMU brut dans `src/imu_head_synthesis.py`. C’est le **comportement par défaut** pour `--multimodal-only`.
-
-**Entraînement multimodal (recommandé)** — synthèse tête depuis l’IMMU :
-
-```bash
-python src/train_model.py --sensor-root sensor_data/sensor_data --cows C01 C02 --dates 0725 --include-mag --multimodal-only --history-seconds 3 --out-dir artifacts/model
-```
-
-**Entraînement avec les CSV historiques** `sub_data/head_direction/Txx/...` à la place :
-
-```bash
-python src/train_model.py --sensor-root sensor_data/sensor_data --cows C01 --dates 0725 --include-mag --multimodal-only --use-head-direction-csv --out-dir artifacts/model
-```
-
-Le fichier `metadata_multimodal.json` enregistre `head_source`: `synthesize_imu_mag` (défaut) ou `head_csv`.
+| Layer | Technology |
+|-------|------------|
+| **Mobile UX** | React Native, **Expo**, React Navigation, charts, maps, i18n |
+| **Inference** | Python 3, NumPy/Pandas/sklearn, PyTorch, TensorFlow/Keras, Stable-Baselines3 |
+| **Optional services** | Django + DRF (`PI_Backend`, `bovitech-chatbot-main`) |
 
 ---
 
-## C) Predict on new sensor data (your real goal)
+## Roadmap ideas
 
-When you get a fresh IMMU file from a cow sensor:
-
-```bash
-python src/predict_behavior.py --immu-file path/to/new_sensor.csv --model-dir artifacts/model --output-csv artifacts/predictions/new_predictions.csv
-```
-
-**Modèle multimodal** (même pipeline que l’entraînement « synthèse tête ») : sans `--head-file`, la tête est **calculée depuis l’IMMU** ; ajoutez `--use-multimodal`.
-
-```bash
-python src/predict_behavior.py --immu-file path/to/new_sensor.csv --model-dir artifacts/model --use-multimodal --output-csv artifacts/predictions/new_predictions.csv
-```
-
-Optionnel : `--head-file path/to/head.csv` pour utiliser un CSV tête au lieu de la synthèse (ex. ancien modèle entraîné avec `--use-head-direction-csv`).
-
-Optional class names:
-
-```bash
-python src/predict_behavior.py --immu-file path/to/new_sensor.csv --model-dir artifacts/model --behavior-map artifacts/model/behavior_map.json --output-csv artifacts/predictions/new_predictions.csv
-```
-
-Prediction output:
-
-- `ts_sec`
-- `pred_behavior`
-- optional `pred_behavior_name`
-
-This gives you second-by-second cow behavior timeline.
+- Hardening deployment: container images, health metrics, HTTPS reverse proxy.
+- Optional migration of `model_http_api.py` to **FastAPI** + OpenAPI for generated clients.
+- Centralized persistence (**PostgreSQL** / **Supabase**) for telemetry and audit trails.
+- On-device or edge **TFLite** paths for low-latency vocal and behavior models.
 
 ---
 
-## 6) What Feature Extraction Is Doing
+## License
 
-For each second (`ts_sec`), all high-frequency IMMU rows inside that second are summarized using:
-
-- `mean`
-- `std`
-- `min`
-- `max`
-- `median`
-
-Applied to:
-
-- `accel_x_mps2`, `accel_y_mps2`, `accel_z_mps2`
-- `accel_mag = sqrt(x^2 + y^2 + z^2)`
-- optional `mag_mag = sqrt(mx^2 + my^2 + mz^2)`
-
-Also adds:
-
-- `samples_per_sec` (quality/control feature)
-
-This transforms raw stream into machine-learning-ready tabular features.
+Specify your license here (e.g. MIT, Apache-2.0, or academic / internal-only). If this is a school project, state restrictions from ESPRIT or your team’s policy.
 
 ---
 
-## 7) Model Details (Current Baseline)
+## Citation / academic use
 
-Model:
-
-- `RandomForestClassifier`
-- `class_weight="balanced"` for class imbalance
-- stratified train/test split
-
-Why RandomForest first:
-
-- robust with tabular features
-- no strict scaling required
-- easy to interpret with feature importances
-- good baseline before trying more complex sequence models
-
----
-
-## 8) Data Quality Checklist (Very Important for Real Sensors)
-
-Before prediction on live/farm data:
-
-1. **Timestamp validity**: Unix seconds/fractions are correct
-2. **Sampling consistency**: check `samples_per_sec` distribution
-3. **Missing data**: ensure no long gaps
-4. **Sensor orientation changes**: if collar orientation differs, retraining may be needed
-5. **Domain shift**: new cows/farm conditions can reduce accuracy
-
----
-
-## 9) Recommended Next Improvements
-
-1. Add rolling temporal context (3s, 5s windows)
-2. Add jerk/energy/percentile features
-3. Evaluate with time-based split (more realistic than random split)
-4. Add post-processing smoothing (majority vote over 3-5 sec)
-5. Retrain periodically with your own farm-labeled data
-
----
-
-## 10) Quick Start Commands (Copy/Paste)
-
-```bash
-pip install -r requirements.txt
-python src/train_model.py --sensor-root sensor_data/sensor_data --cows C01 C02 C03 C04 --dates 0725 --include-mag --out-dir artifacts/model
-python src/predict_behavior.py --immu-file sensor_data/sensor_data/main_data/immu/T01/T01_0725.csv --model-dir artifacts/model --output-csv artifacts/predictions/T01_0725_pred.csv
-```
-
----
-
-## 11) Final Practical Note for Your Main Goal
-
-For your real deployment:
-
-1. Keep this exact feature pipeline unchanged
-2. Train model on as much labeled data as possible
-3. Save model + metadata
-4. For each new sensor file from your cow, run `predict_behavior.py`
-5. Visualize predictions over time to monitor behavior trends
-
-That is your production-ready path from:
-
-**raw sensor -> features per second -> trained model -> cow behavior output**
-
----
-
-✅ LEVEL 1 (your current V2 — GOOD)
-
-👉 Only:
-
-IMMU
-
-✔ Works
-✔ Simple
-❌ Limited accuracy
-
-LEVEL 2 (BEST balance — what you should build)
-
-👉 Use ONLY:
-
-✅ IMMU (movement)
-✅ UWB (position)
-✅ Head direction
-
-👉 Why?
-
-Because paper says:
-
-UWB alone is not enough
-Head direction helps distinguish similar behaviors
-IMMU captures motion patterns
-
-## 12) Bovitech-V3: Multimodal sensor support (IMMU, Ankle, UWB, Head Direction)
-
-### Why this section exists
-For your next version (Bovitech-V3), the codebase in `mmcows-main/benchmarks` already supports multiple modalities and fusion setups. This section explains what they are and how the data shapes up.
-
-### Data modalities and frequency
-- `main_data/immu/Txx/Txx_MMDD.csv`: IMMU accelerometer + optional magnetometer (high frequency, 40-100 Hz in your current files)
-- `main_data/ankle/Cxx/Cxx_MMDD.csv`: Ankle sensor (10 Hz, includes leg movement features)
-- `main_data/uwb/Txx/Txx_MMDD.csv`: UWB location (1/15 Hz, useful for spatial context)
-- `sub_data/head_direction/Txx/Txx_MMDD.csv`: Head direction (10 Hz)
-- `behavior_labels/individual/Cxx_MMDD.csv`: label timeline (1 Hz)
-
-### File mapping for behavior classes
-Use `artifacts/model/behavior_map.json` with **IDs 1–7** (class `0` = Unknown exists in raw labels but is **excluded from training** by default):
-
-- 1: Walking
-- 2: Standing
-- 3: Feeding head up
-- 4: Feeding head down
-- 5: Licking
-- 6: Drinking
-- 7: Lying
-
-For any modality/fusion model, keep the same class IDs to maintain compatibility (or extend with new IDs and update the map accordingly).
-
-### Multimodal preprocessing (from `mmcows-main/benchmarks/1_behavior_cls/uwb_hd_akl/data_loader.py`)
-- IMMU pipeline (current `src/pipeline_utils.py`) does per-second aggregation via `groupby(ts_sec)`.
-- UWB/HD/Ankle pipeline does:
-  1. load UWB (1/15 Hz), HD (10 Hz), ankle (10 Hz) and labels (1 Hz)
-  2. aggregate HD from 10 Hz to 1 Hz using mean per second
-  3. align to UWB timestamps and optionally drop timestamps where behavior==0
-  4. merge UWB+HD+Ankle per timestamp and join label for supervised training
-
-### Model training orchestration (Bovitech-V3 vision)
-- `train_uwb_hd_akl.py`, `test_uwb_hd_akl.py` in `benchmarks/2_beahvior_analysis` show fusion experiments.
-- They use `data_loader_s1` (object split) and `data_loader_s2` (temporal split) from same module.
-
-### Suggested migration plan for Bovitech-V3
-1. Keep `src/pipeline_utils.py` for IMMU-only baseline.
-2. Add `src/pipeline_utils_multimodal.py` with generic helpers:
-   - `load_uwb_csv`, `load_ankle_csv`, `load_head_direction_csv`, `load_label_csv`
-   - `aggregate_uwb`, `aggregate_ankle`, `aggregate_head`, `align_modalities`
-3. Add `src/build_dataset_multimodal.py` like `build_dataset.py` but accepts modality list.
-4. Add `src/train_model_multimodal.py` to train fusion models (RF, XGBoost, etc.) and save metrics.
-5. Keep `behavior_map.json` in sync with label schema.
-
-### Sanity check command
-```bash
-python - <<'PY'
-import json, pathlib
-path=pathlib.Path('artifacts/model/behavior_map.json')
-print('exists',path.exists())
-print(json.loads(path.read_text('utf-8')))
-PY
-```
-
-### One-page quick understanding
-1. read raw files with `pandas.read_csv`
-2. check timestamps with `.diff().median()` for expected Hz
-3. align each modality to one common timeline (e.g., seconds or UWB 1/15s)
-4. merge behavior labels to create supervised dataset
-5. train + evaluate + predict
-
----
-
-✅ Behavior map is correct and ready. Bovitech-V3 is now clearly scoped for ankle and UWB too, and this README addition explains both data and pipeline behavior.
+If you reuse this work academically, please cite the **ESPRIT** program and link this repository once public.

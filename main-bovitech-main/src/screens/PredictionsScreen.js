@@ -12,17 +12,22 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
+import { Audio } from 'expo-av';
 import { LineChart } from 'react-native-chart-kit';
 import { colors } from '../theme/colors';
 import { API_BASE_URL } from '../config/api';
 import {
   checkPredictionApi,
   predictBehavior,
+  predictIllness,
   predictMilk,
   predictStress,
+  predictVocal,
   simulateTick,
 } from '../services/predictionApi';
 import { fetchBarnSensor } from '../services/barnSensors';
+import { illnessSanteValueFr } from '../services/liveFarmModels';
+import { recordingUriToBase64 } from '../services/vocalRecordBase64';
 
 const cardShadow =
   Platform.OS === 'ios'
@@ -89,12 +94,91 @@ export default function PredictionsScreen() {
   const [behaviorSeries, setBehaviorSeries] = React.useState([]);
   const [milkSeries, setMilkSeries] = React.useState([]);
   const [stressSeries, setStressSeries] = React.useState([]);
+  const [illnessScoreSeries, setIllnessScoreSeries] = React.useState([]);
+  const [vocalIsRecording, setVocalIsRecording] = React.useState(false);
+  const [vocalLoading, setVocalLoading] = React.useState(false);
+  const [vocalResult, setVocalResult] = React.useState(null);
+  const vocalRecordingRef = React.useRef(null);
 
   const stressLabelFr = (name) => {
     if (name === 'At risk') return 'A risque';
     if (name === 'Stressed') return 'Stressé';
     if (name === 'Normal') return 'Normal';
     return name || '--';
+  };
+
+  const vocalLabelDisplayFr = (name) => {
+    if (!name) return '--';
+    if (name === 'besoin_nourriture') return 'Besoin de nourriture';
+    if (name === 'toux') return 'Toux';
+    if (name === 'normal') return 'Normal';
+    if (name === 'ovulation') return 'Ovulation';
+    return name;
+  };
+
+  const ensureMicPermission = async () => {
+    const perm = await Audio.requestPermissionsAsync();
+    if (perm.granted) return true;
+    setError(
+      perm.status === 'denied'
+        ? 'Permission micro refusée. Activez le micro dans les réglages.'
+        : 'Permission micro nécessaire pour enregistrer.'
+    );
+    return false;
+  };
+
+  const startVocalRecording = async () => {
+    setError('');
+    setVocalResult(null);
+    const ok = await ensureMicPermission();
+    if (!ok) return;
+    try {
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: true,
+        playsInSilentModeIOS: true,
+      });
+      const { recording } = await Audio.Recording.createAsync(
+        Audio.RecordingOptionsPresets.HIGH_QUALITY
+      );
+      vocalRecordingRef.current = recording;
+      setVocalIsRecording(true);
+    } catch (e) {
+      setError(e?.message || 'Impossible de démarrer l’enregistrement');
+      setVocalIsRecording(false);
+      vocalRecordingRef.current = null;
+    }
+  };
+
+  const stopVocalAndPredict = async () => {
+    const rec = vocalRecordingRef.current;
+    if (!rec) return;
+    setVocalLoading(true);
+    setError('');
+    try {
+      await rec.stopAndUnloadAsync();
+      const uri = rec.getURI();
+      vocalRecordingRef.current = null;
+      setVocalIsRecording(false);
+      if (!uri) {
+        throw new Error('Fichier audio introuvable');
+      }
+      const b64 = await recordingUriToBase64(uri);
+      const out = await predictVocal(b64);
+      setVocalResult(out);
+      if (!out?.ok) {
+        setError(out?.error || 'Erreur prédiction vocale');
+      }
+    } catch (e) {
+      setVocalResult(null);
+      setError(e?.response?.data?.error || e.message || 'Erreur audio / API');
+    } finally {
+      setVocalLoading(false);
+      try {
+        await Audio.setAudioModeAsync({ allowsRecordingIOS: false });
+      } catch {
+        /* ignore */
+      }
+    }
   };
 
   const [behaviorInputs, setBehaviorInputs] = React.useState({
@@ -127,6 +211,15 @@ export default function PredictionsScreen() {
   React.useEffect(() => {
     milkInputsRef.current = milkInputs;
   }, [milkInputs]);
+
+  React.useEffect(() => {
+    return () => {
+      const r = vocalRecordingRef.current;
+      if (!r) return;
+      vocalRecordingRef.current = null;
+      r.stopAndUnloadAsync().catch(() => {});
+    };
+  }, []);
 
   React.useEffect(() => {
     let cancelled = false;
@@ -282,7 +375,38 @@ export default function PredictionsScreen() {
     } catch {
       /* garde le stress du tick */
     }
-    setLiveData({ ...data, milk, stress });
+
+    let illness = null;
+    try {
+      illness = await predictIllness({
+        cow_id: mi.cow_id,
+        timestamp: new Date().toISOString(),
+        accel_x_mps2: s.accel_x_mps2,
+        accel_y_mps2: s.accel_y_mps2,
+        accel_z_mps2: s.accel_z_mps2,
+        mag_x_uT: s.mag_x_uT,
+        mag_y_uT: s.mag_y_uT,
+        mag_z_uT: s.mag_z_uT,
+        temp_c: br?.ok ? br.temp_c : s.temp_c,
+        humidity_per: br?.ok ? br.humidity : s.humidity_per,
+        thi: br?.ok && br.thi != null ? Number(br.thi) : undefined,
+        cbt_temp_c: s.cbt_temp_c,
+        DIM: parseNumeric(mi.DIM, 220),
+        date: mi.date,
+        milk_lag1: s.milk_lag1,
+        milk_roll3_mean: s.milk_roll3_mean,
+        behavior_mean: s.behavior_mean,
+        behavior_n: s.behavior_n,
+        behavior_std: s.behavior_std,
+        pred_behavior: data?.behavior?.pred_behavior,
+        stress,
+        use_server_lying_buffer: true,
+      });
+    } catch {
+      illness = null;
+    }
+
+    setLiveData({ ...data, milk, stress, illness });
     setBehaviorResult(data?.behavior || null);
     setMilkResult(milk || null);
     setBehaviorSeries((prev) => {
@@ -295,6 +419,9 @@ export default function PredictionsScreen() {
     });
     if (stress?.pred_stress != null && Number.isFinite(Number(stress.pred_stress))) {
       setStressSeries((prev) => [...prev, Number(stress.pred_stress)].slice(-30));
+    }
+    if (illness?.ok && typeof illness.health_score === 'number') {
+      setIllnessScoreSeries((prev) => [...prev, Number(illness.health_score)].slice(-30));
     }
   };
 
@@ -333,7 +460,9 @@ export default function PredictionsScreen() {
                 <Text style={styles.aiChipText}>MODELS ONLINE</Text>
               </View>
               <Text style={styles.screenTitle}>Predictions IA</Text>
-              <Text style={styles.screenSub}>Integration moderne des modeles milk + behavior</Text>
+              <Text style={styles.screenSub}>
+                Lait, comportement, stress, santé PPO (maladie + score 0–100) et vocal
+              </Text>
             </View>
           </View>
         </View>
@@ -353,7 +482,7 @@ export default function PredictionsScreen() {
             <Text style={styles.apiUrl}>Endpoint: {API_BASE_URL}</Text>
           </View>
 
-          <Text style={styles.sectionKicker}>Live (IMU + prédiction lait)</Text>
+          <Text style={styles.sectionKicker}>Live (IMU + lait + stress + santé)</Text>
           <View style={[styles.card, cardShadow]}>
             <View style={styles.liveHeaderRow}>
               <View>
@@ -363,8 +492,8 @@ export default function PredictionsScreen() {
                   {barn?.ok
                     ? 'ferme (GET /barn_sensor).'
                     : 'dérivé T/RH du formulaire lait (ou sim).'}
-                  {' '}CBT/lying: CBT = champ lait; allongement = buffer 8h côté API (classe
-                  comportement 7 = couchée).
+                  {' '}Santé: POST /predict/illness (PPO + fusion score). CBT/lying: buffer 8h
+                  côté API (classe 7 = couchée).
                 </Text>
               </View>
               <View style={[styles.liveBadge, liveRunning ? styles.liveBadgeOn : styles.liveBadgeOff]}>
@@ -459,7 +588,7 @@ export default function PredictionsScreen() {
               </>
             )}
 
-            {(liveData?.behavior || liveData?.milk || liveData?.stress) && (
+            {(liveData?.behavior || liveData?.milk || liveData?.stress || liveData?.illness) && (
               <View style={styles.livePredGrid}>
                 {liveData?.behavior && (
                   <View style={[styles.resultCard, styles.livePredCard]}>
@@ -499,6 +628,35 @@ export default function PredictionsScreen() {
                     ) : (
                       <Text style={styles.resultSub}>
                         {liveData.stress.error || 'Modèle indisponible. Copiez StressDetectionV3_trained.pt dans finale_model/ ou définissez STRESS_V3_CHECKPOINT.'}
+                      </Text>
+                    )}
+                  </View>
+                )}
+                {liveData?.illness && (
+                  <View style={[styles.resultCard, styles.livePredCard, styles.stressCard]}>
+                    <Text style={styles.resultTitle}>Santé maladie (PPO + score temporel)</Text>
+                    {liveData.illness.ok ? (
+                      <>
+                        <Text style={styles.resultMain}>
+                          {illnessSanteValueFr(liveData.illness) || '—'}
+                        </Text>
+                        <Text style={styles.resultSub}>
+                          {liveData.illness.probabilities
+                            ? Object.entries(liveData.illness.probabilities)
+                                .map(([k, v]) => `${k}: ${(Number(v) * 100).toFixed(0)}%`)
+                                .join('  ')
+                            : '—'}
+                        </Text>
+                        {liveData.illness.confidence != null && Number.isFinite(Number(liveData.illness.confidence)) && (
+                          <Text style={styles.resultSub}>
+                            Confiance choix: {(Number(liveData.illness.confidence) * 100).toFixed(0)}%
+                          </Text>
+                        )}
+                      </>
+                    ) : (
+                      <Text style={styles.resultSub}>
+                        {liveData.illness.error ||
+                          'Modèle indisponible. Placez illness_ppo sous finale_model/artifacts/illness_model/ (voir API /health → illness_ppo).'}
                       </Text>
                     )}
                   </View>
@@ -594,6 +752,90 @@ export default function PredictionsScreen() {
                   bezier
                   style={styles.chart}
                 />
+              </View>
+            )}
+
+            {illnessScoreSeries.length > 1 && (
+              <View style={styles.chartCard}>
+                <Text style={styles.resultTitle}>Score santé 0–100 (fusion PPO + règles) — live</Text>
+                <LineChart
+                  data={{
+                    labels: illnessScoreSeries
+                      .map((_, i) => String(i + 1))
+                      .filter((_, i, arr) => i % 5 === 0 || i === arr.length - 1),
+                    datasets: [{ data: illnessScoreSeries }],
+                  }}
+                  width={chartWidth}
+                  height={180}
+                  yAxisSuffix=""
+                  fromZero
+                  withDots={false}
+                  withInnerLines
+                  withOuterLines={false}
+                  chartConfig={{
+                    backgroundColor: '#FFFFFF',
+                    backgroundGradientFrom: '#FFFFFF',
+                    backgroundGradientTo: '#FFFFFF',
+                    decimalPlaces: 0,
+                    color: (opacity = 1) => `rgba(46, 65, 45, ${opacity})`,
+                    labelColor: (opacity = 1) => `rgba(92, 92, 87, ${opacity})`,
+                    propsForBackgroundLines: { stroke: 'rgba(45,106,79,0.12)' },
+                  }}
+                  bezier
+                  style={styles.chart}
+                />
+              </View>
+            )}
+          </View>
+
+          <Text style={styles.sectionKicker}>Son / vocal</Text>
+          <View style={[styles.card, cardShadow]}>
+            <Text style={styles.cardTitle}>État vache (audio)</Text>
+            <Text style={styles.inputHint}>
+              Enregistrez un son de vache (toux, normal, ovulation, besoin de nourriture). Le serveur envoie
+              l’audio au modèle Keras (mel 128×128). Formats typiques: M4A (mobile). Sur navigateur web, l’audio
+              est lu via le navigateur (souvent WebM) puis encodé en base64 sans expo-file-system. Sur Windows,
+              installez ffmpeg si le décodage M4A côté serveur échoue.
+            </Text>
+            <View style={styles.vocalActionsRow}>
+              <TouchableOpacity
+                style={[styles.secondaryBtn, vocalIsRecording ? styles.recordBtnActive : null]}
+                onPress={vocalIsRecording ? undefined : startVocalRecording}
+                disabled={vocalLoading || vocalIsRecording}
+                activeOpacity={0.85}
+              >
+                <Ionicons name="mic" size={18} color={vocalIsRecording ? '#fff' : colors.green} />
+                <Text style={[styles.secondaryBtnText, vocalIsRecording ? styles.recordBtnTextOn : null]}>
+                  {vocalIsRecording ? 'En cours…' : 'Enregistrer'}
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.primaryBtn, styles.vocalStopBtn]}
+                onPress={stopVocalAndPredict}
+                disabled={!vocalIsRecording || vocalLoading}
+                activeOpacity={0.9}
+              >
+                {vocalLoading ? (
+                  <ActivityIndicator color="#fff" />
+                ) : (
+                  <>
+                    <Ionicons name="stop-circle" size={18} color="#fff" />
+                    <Text style={styles.primaryBtnText}>Arrêter & prédire</Text>
+                  </>
+                )}
+              </TouchableOpacity>
+            </View>
+            {vocalResult?.ok && (
+              <View style={styles.resultCard}>
+                <Text style={styles.resultTitle}>Résultat</Text>
+                <Text style={styles.resultMain}>{vocalLabelDisplayFr(vocalResult.pred_vocal_name)}</Text>
+                <Text style={styles.resultSub}>
+                  {vocalResult.probabilities
+                    ? Object.entries(vocalResult.probabilities)
+                        .map(([k, v]) => `${vocalLabelDisplayFr(k)}: ${(Number(v) * 100).toFixed(0)}%`)
+                        .join('   ')
+                    : ''}
+                </Text>
               </View>
             )}
           </View>
@@ -935,6 +1177,37 @@ const styles = StyleSheet.create({
     color: colors.text,
     paddingHorizontal: 10,
     paddingVertical: 9,
+  },
+  vocalActionsRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+    marginTop: 6,
+    alignItems: 'center',
+  },
+  secondaryBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderRadius: 12,
+    borderWidth: 1.5,
+    borderColor: greenBorder,
+    backgroundColor: '#FAFCFA',
+    minHeight: 44,
+  },
+  secondaryBtnText: { color: colors.green, fontWeight: '700', fontSize: 14 },
+  recordBtnActive: {
+    backgroundColor: colors.green,
+    borderColor: colors.green,
+  },
+  recordBtnTextOn: { color: '#fff' },
+  vocalStopBtn: {
+    marginTop: 0,
+    flex: 1,
+    flexGrow: 1,
+    minWidth: 160,
   },
   primaryBtn: {
     marginTop: 14,
